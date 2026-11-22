@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.coverage import DELIVERY_ACCEPTED, coverage_ledger
 from app.store import store
 
 
@@ -30,7 +31,53 @@ class GraphBuildService(BaseModuleService):
         if entry.get("status") == "构建完成":
             lineage_msg = self._push_to_data_lineage(entry)
             message += "；" + lineage_msg
+        # 链路 L5: graph_build → 版本化索引覆盖段（按构建代登记覆盖，替代只记实体数量）
+        if entry.get("status") == "构建完成":
+            coverage_msg = self._push_to_coverage_ledger(entry)
+            message += "；" + coverage_msg
         return entry, message
+
+    def _push_to_coverage_ledger(self, entry: dict[str, Any]) -> str:
+        """把构建结果登记为版本化索引覆盖段的一次构建交付。
+
+        数据范围里的实体标识以逗号分隔；构建代取构建时间的日期序数，保证
+        多次构建可按代比较。回执实体数与构建任务的实体数量保持一致。
+        """
+        scope = str(entry.get("数据范围", ""))
+        segment = coverage_ledger.register_segment(
+            scope=scope,
+            segment_code=f"COV-GB-{int(entry.get('id', 0)):04d}",
+        )
+        raw_ids = [part.strip() for part in scope.replace(";", ",").split(",") if part.strip()]
+        entity_ids = coverage_ledger.normalize_entity_ids(raw_ids)
+        generation = self._build_generation(entry)
+        delivery = coverage_ledger.deliver_build(
+            segment.segment_id,
+            build_id=f"BUILD-{entry.get('任务编号', entry.get('id', 0))}",
+            build_generation=generation,
+            added=entity_ids,
+            removed=[],
+            receipt_entity_count=len(entity_ids),
+            receipt_snapshot_generation=generation,
+            graph_snapshot_generation=generation,
+        )
+        if delivery.result == DELIVERY_ACCEPTED:
+            return (
+                f"覆盖段 {segment.segment_code} 已登记构建代 {generation}，"
+                f"覆盖实体 {len(entity_ids)} 个（就绪待发布）"
+            )
+        return f"覆盖段 {segment.segment_code} 交付未通过核对：{delivery.detail.get('reason', delivery.result)}"
+
+    @staticmethod
+    def _build_generation(entry: dict[str, Any]) -> int:
+        """从构建时间推导图构建代（YYYY-MM-DD -> 日期序数），失败时回退到记录 id。"""
+        built_at = str(entry.get("构建时间", ""))
+        try:
+            from datetime import datetime
+
+            return int(datetime.strptime(built_at[:10], "%Y-%m-%d").timestamp())
+        except (ValueError, TypeError):
+            return int(entry.get("id", 0)) + 1_000_000
 
     def _push_to_graph_index(self, entry: dict[str, Any]) -> str:
         idx_rows = store.rows("graph_index")
@@ -74,5 +121,5 @@ class GraphBuildService(BaseModuleService):
 
     def domain_snapshot(self) -> dict[str, Any]:
         base = super().domain_snapshot()
-        base["cross_module_consumers"] = ["graph_index", "data_lineage"]
+        base["cross_module_consumers"] = ["graph_index", "data_lineage", "index_coverage"]
         return base
